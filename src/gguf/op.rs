@@ -32,12 +32,14 @@ use super::tensor::Q4Tensor;
 const TILED_M_THRESHOLD: usize = 4;
 
 /// Workgroup size X for the tiled kernel (1D workgroups).
-/// 256 threads per block gives 8 warps — good occupancy on 4090 SM89.
-const TILED_WG_X: usize = 256;
+/// 32 threads per block (1 warp) gives ceil(N/32) blocks. For N=3072 that is
+/// 96 blocks across 128 SMs — ~75% utilisation vs 9% with 256.
+const TILED_WG_X: usize = 32;
 
 /// Tile size for K-dimension shared memory (must be a multiple of 32).
-/// 1024 halves the number of tile iterations vs 512, reducing barrier overhead.
-const TILE_K: usize = 1024;
+/// 256 keeps each thread's per-tile load at 8 F32s (32 bytes) — coalesced
+/// within a single warp, low shared-memory pressure (1 KB per block).
+const TILE_K: usize = 256;
 
 /// Workgroup size X for the naive kernel (2D workgroups).
 const NAIVE_WG_X: usize = 16;

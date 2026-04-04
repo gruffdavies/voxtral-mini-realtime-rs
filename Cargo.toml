@@ -34,6 +34,8 @@ profiling = ["tracing-chrome"]
 # Burn ML framework - latest version with backend selection via features
 burn = { version = "0.20", default-features = false, features = ["std", "autodiff", "template", "autotune"] }
 cubecl = { version = "0.9", default-features = false, features = ["wgpu"] }
+# burn-cubecl: CubeRuntime trait needed for <R: CubeRuntime, B: Backend> generics in Q4 path
+burn-cubecl = { version = "0.20", default-features = false }
 # CUDA backend (enabled by "cuda" feature)
 burn-cuda = { version = "0.20", optional = true }
 

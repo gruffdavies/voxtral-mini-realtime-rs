@@ -73,6 +73,35 @@ through all `src/gguf/` files so the pipeline compiles for any CubeCL-backed Bur
 - `cargo build --features "wgpu,cli,native-tokenizer,cuda"` → clean (CUDA path compiles too)
 - `cargo test --features "wgpu,native-tokenizer"` → **239 tests pass** (231 unit + 4 integration + 3 tts_model + 1 tts integration)
 
+### Phase 6 — SM utilisation fix: TILED_WG_X 256→32, TILE_K 1024→256 ✅ Complete
+
+**Root cause identified:** With `TILED_WG_X=256`, grid size = `ceil(N/256)` blocks.
+For the dominant backbone shapes (N=3072, 4096) that launches 12–16 blocks on a
+GPU with 128 SMs — 9–12% SM utilisation. The GPU was mostly idle.
+
+**Fix:** `TILED_WG_X=32` (1 warp per block) → `ceil(N/32)` blocks:
+- N=3072 → 96 blocks (75% utilisation)
+- N=4096 → 128 blocks (100%)
+- N=9216 → 288 blocks (225%, 2+ blocks/SM for latency hiding)
+
+`TILE_K=256` keeps per-thread tile load at 8 F32s (32 bytes) — one coalesced
+warp-width transaction. Shared memory drops from 4 KB to 1 KB per block.
+
+**Benchmark (RTX 4090, warm cache, CUBECL_AUTOTUNE_LEVEL=minimal):**
+
+| Text | Before (WGX=256) | After (WGX=32) | Δ |
+|---|---|---|---|
+| "Hello world" | 21.5× | **15.2×** | −29% |
+| Long sentence | 8.4× | **6.4×** | −24% |
+
+**Why not the theoretical 3–8×?** Q4 matmul speedup diluted by:
+- Burn's standard CUDA matmul for attention scores
+- RMS norm, RoPE, softmax (element-wise Burn ops)
+- Kernel-launch overhead (~100+ dispatches per decode step)
+
+Overall improvement from original baseline (RTF 30×): **2× total**.
+Not real-time. Remaining bottlenecks are outside the Q4 kernel.
+
 ### Phase 5 — Option 1: aligned weights + kernel constant tuning ✅ Complete
 
 **Goal:** Eliminate `read_u32_unaligned` overhead and tune kernel constants for 4090.
