@@ -91,26 +91,60 @@ pub fn run(args: Args) -> Result<()> {
 
 #[cfg(feature = "cuda")]
 fn run_cuda(args: Args) -> Result<()> {
-    use burn::backend::Cuda;
-    use burn::backend::cuda::CudaDevice;
-    use burn::tensor::Tensor;
+    // Use CubeBackend<CudaRuntime, f32, i32> directly (non-fusion) so that
+    // FloatTensorPrimitive = CubeTensor<CudaRuntime> matches our Q4 constraint.
+    use burn_cubecl::CubeBackend;
+    use cubecl::cuda::CudaRuntime;
 
-    let device = CudaDevice::default();
-    let info = burn::backend::cuda::CudaDevice::default();
-    info!("CUDA device: {:?}", info);
+    type CudaBackend = CubeBackend<CudaRuntime, f32, i32, u8>;
 
-    // Smoke test: allocate a small tensor and confirm CUDA is active.
-    let t: Tensor<Cuda, 1> = Tensor::zeros([4], &device);
-    let val = t.sum().into_scalar();
-    info!("CUDA smoke test: sum of zeros = {val} (expected 0)");
+    let device = cubecl::cuda::CudaDevice::default();
+    info!("CUDA device: {device:?}");
 
-    // Delegate to Q4 inference once smoke test passes.
-    // Phase 1: only the smoke test is wired; full inference comes in Phase 3.
-    bail!(
-        "CUDA smoke test passed — device is active.\n\
-         Full Q4 inference on CUDA will be enabled in Phase 3 of the refactor.\n\
-         Run with --device wgpu for inference now."
-    )
+    // Resolve tokenizer
+    let tokenizer_path = match &args.tokenizer {
+        Some(p) => PathBuf::from(p),
+        None => {
+            if let Some(gguf) = &args.gguf {
+                let gguf_dir = PathBuf::from(gguf)
+                    .parent()
+                    .unwrap_or(&PathBuf::from("."))
+                    .to_path_buf();
+                let candidates = [
+                    gguf_dir.join("tekken.json"),
+                    PathBuf::from("models/voxtral-tts/tekken.json"),
+                    PathBuf::from("models/voxtral/tekken.json"),
+                ];
+                candidates
+                    .into_iter()
+                    .find(|p| p.exists())
+                    .ok_or_else(|| anyhow::anyhow!("Tokenizer not found. Provide --tokenizer"))?
+            } else {
+                PathBuf::from(&args.model).join("tekken.json")
+            }
+        }
+    };
+
+    let token_ids: Vec<u32> = if let Some(ids) = &args.token_ids {
+        ids.clone()
+    } else if let Some(text) = &args.text {
+        if !tokenizer_path.exists() {
+            bail!("Tokenizer not found at {}", tokenizer_path.display());
+        }
+        let encoder =
+            TekkenEncoder::from_file(&tokenizer_path).context("Failed to load tokenizer")?;
+        encoder.encode(text)
+    } else if !args.list_voices {
+        bail!("--text or --token-ids required");
+    } else {
+        vec![]
+    };
+
+    if let Some(gguf_path) = &args.gguf {
+        run_q4::<CudaRuntime, CudaBackend>(&args, gguf_path, &token_ids, &device)
+    } else {
+        bail!("CUDA inference requires --gguf (BF16 safetensors path not supported on CUDA)")
+    }
 }
 
 fn run_wgpu(args: Args) -> Result<()> {
@@ -158,7 +192,7 @@ fn run_wgpu(args: Args) -> Result<()> {
     };
 
     if let Some(gguf_path) = &args.gguf {
-        run_q4(&args, gguf_path, &token_ids, &device)
+        run_q4::<burn::backend::wgpu::WgpuRuntime, burn::backend::Wgpu>(&args, gguf_path, &token_ids, &device)
     } else {
         run_bf16(&args, &token_ids, &device)
     }
@@ -226,13 +260,20 @@ fn run_bf16(
     save_audio(&audio, &args.output, gen_start.elapsed(), duration)
 }
 
-/// Q4 GGUF path.
-fn run_q4(
+/// Q4 GGUF path — generic over any CubeCL-backed Burn backend.
+fn run_q4<Rt, B>(
     args: &Args,
     gguf_path: &str,
     token_ids: &[u32],
-    device: &burn::backend::wgpu::WgpuDevice,
-) -> Result<()> {
+    device: &Rt::Device,
+) -> Result<()>
+where
+    Rt: burn_cubecl::CubeRuntime,
+    B: burn::tensor::backend::Backend<
+        FloatTensorPrimitive = burn_cubecl::tensor::CubeTensor<Rt>,
+        Device = Rt::Device,
+    >,
+{
     use voxtral_mini_realtime::gguf::Q4TtsModelLoader;
     use voxtral_mini_realtime::tts::config::{AudioCodebookLayout, TtsSpecialTokens};
     use voxtral_mini_realtime::tts::embeddings::AudioCodebookEmbeddings;
@@ -249,7 +290,7 @@ fn run_q4(
     // Use load_deferred+finalize to keep token embeddings as Q4 (~216 MB) rather
     // than dequantizing to f32 (~1.5 GB). Works on GPU and CPU/software renderers.
     let (backbone, mut fm, codec) = loader
-        .load_deferred(device)
+        .load_deferred::<Rt, B>(device)
         .context("Failed to load Q4 model")?
         .finalize()
         .context("Failed to finalize Q4 model")?;
@@ -297,7 +338,7 @@ fn run_q4(
         );
     }
     let voice_bytes = std::fs::read(&voice_path)?;
-    let voice_embed: Tensor<Backend, 2> =
+    let voice_embed: Tensor<B, 2> =
         load_voice_from_bytes(&voice_bytes, 3072, device).context("Failed to load voice")?;
     info!(
         voice = %args.voice,
@@ -361,7 +402,7 @@ fn run_q4(
             acoustic_data.push(level as f32);
         }
     }
-    let acoustic_tensor: Tensor<Backend, 2> = Tensor::from_data(
+    let acoustic_tensor: Tensor<B, 2> = Tensor::from_data(
         burn::tensor::TensorData::new(acoustic_data, [n_frames, 36]),
         device,
     );

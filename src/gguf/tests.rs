@@ -6,10 +6,12 @@
 #[cfg(test)]
 mod tests {
     use crate::gguf::*;
+    use burn::backend::wgpu::WgpuRuntime;
     use burn::backend::Wgpu;
     use burn::tensor::{Tensor, TensorData};
 
     type TestBackend = Wgpu;
+    type TestRuntime = WgpuRuntime;
 
     // =========================================================================
     // CPU-side Q4_0 helpers (test-only)
@@ -574,7 +576,7 @@ mod tests {
         let ffn_dim = 128;
 
         // w1: [ffn_dim, d_model], w2: [d_model, ffn_dim], w3: [ffn_dim, d_model]
-        let make_q4 = |rows: usize, cols: usize| -> Q4Linear {
+        let make_q4 = |rows: usize, cols: usize| -> Q4Linear<TestRuntime, TestBackend> {
             let data: Vec<f32> = (0..rows * cols)
                 .map(|i| ((i as f32) * 0.001).sin() * 0.05)
                 .collect();
@@ -611,7 +613,7 @@ mod tests {
         let test_in = 160;
         let test_out = 96;
 
-        let make_q4 = |rows: usize, cols: usize| -> Q4Linear {
+        let make_q4 = |rows: usize, cols: usize| -> Q4Linear<TestRuntime, TestBackend> {
             let data: Vec<f32> = (0..rows * cols)
                 .map(|i| ((i as f32) * 0.001).cos() * 0.05)
                 .collect();

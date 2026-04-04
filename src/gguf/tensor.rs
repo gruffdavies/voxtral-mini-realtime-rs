@@ -1,38 +1,34 @@
 //! Q4_0 quantized weight tensor stored on GPU.
 //!
-//! [`Q4Tensor`] uploads raw Q4_0 blocks to a GPU storage buffer and provides
-//! a [`dequantize`](Q4Tensor::dequantize) method for diagnostics/testing.
-//! The primary inference path is [`q4_matmul`](super::op::q4_matmul), which
-//! dequantizes on-the-fly inside a fused compute shader.
+//! [`Q4Tensor`] is generic over `R: CubeRuntime` so the same struct works for
+//! both the WGPU (default) and CUDA paths. It uploads raw Q4_0 blocks to a
+//! GPU storage buffer and exposes them for the fused dequant+matmul kernel in
+//! [`super::op`].
 
 use anyhow::{ensure, Result};
-use burn::backend::wgpu::{WgpuDevice, WgpuRuntime};
-use burn::backend::Wgpu;
-use burn::tensor::{Tensor, TensorData};
+use burn_cubecl::CubeRuntime;
 use cubecl::client::ComputeClient;
 use cubecl::server::Handle;
-use cubecl::Runtime;
 
 /// A Q4_0 quantized weight tensor living on GPU.
 ///
 /// The buffer contains raw Q4_0 blocks (18 bytes per block of 32 elements),
-/// laid out exactly as in GGUF. The WGSL shader interprets the buffer as
-/// `array<f16>` with 9 f16 slots per block.
-pub struct Q4Tensor {
+/// laid out exactly as in GGUF.
+pub struct Q4Tensor<R: CubeRuntime> {
     pub(crate) handle: Handle,
     shape: [usize; 2],
     num_blocks: usize,
-    client: ComputeClient<WgpuRuntime>,
-    device: WgpuDevice,
+    client: ComputeClient<R>,
+    device: R::Device,
 }
 
-impl Q4Tensor {
+impl<R: CubeRuntime> Q4Tensor<R> {
     /// Upload raw Q4_0 bytes to a GPU storage buffer.
     ///
     /// Shape is `[N, K]` = `[out_features, in_features]`, matching PyTorch/GGUF
     /// convention. `raw_bytes` must contain exactly `(N * K / 32) * 18` bytes.
     /// The element count `N * K` must be divisible by 32.
-    pub fn from_q4_bytes(raw_bytes: &[u8], shape: [usize; 2], device: &WgpuDevice) -> Result<Self> {
+    pub fn from_q4_bytes(raw_bytes: &[u8], shape: [usize; 2], device: &R::Device) -> Result<Self> {
         let [n, k] = shape;
         let num_elements = k * n;
         ensure!(
@@ -47,9 +43,9 @@ impl Q4Tensor {
             raw_bytes.len()
         );
 
-        let client = WgpuRuntime::client(device);
+        let client = R::client(device);
 
-        // Pad to 4-byte alignment for array<u32> access in the WGSL shader.
+        // Pad to 4-byte alignment for u32-granularity access in the kernel.
         // Q4_0 blocks are 18 bytes, so total size may not be a multiple of 4.
         let padded = if !raw_bytes.len().is_multiple_of(4) {
             let pad = 4 - (raw_bytes.len() % 4);
@@ -81,9 +77,6 @@ impl Q4Tensor {
     }
 
     /// Read raw Q4_0 bytes from GPU.
-    ///
-    /// Returns exactly `num_blocks * 18` bytes (may include padding at end
-    /// that was added for 4-byte alignment).
     pub fn read_bytes(&self) -> Vec<u8> {
         let raw = self.client.read_one(self.handle.clone());
         let expected = self.num_blocks * 18;
@@ -95,12 +88,31 @@ impl Q4Tensor {
         raw[..expected].to_vec()
     }
 
+    /// Compute client for this tensor.
+    pub(crate) fn client(&self) -> &ComputeClient<R> {
+        &self.client
+    }
+
+    /// Device this tensor lives on.
+    pub(crate) fn device(&self) -> &R::Device {
+        &self.device
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WGPU-only methods
+// ---------------------------------------------------------------------------
+
+#[cfg(not(target_family = "wasm"))]
+impl Q4Tensor<burn::backend::wgpu::WgpuRuntime> {
     /// Dequantize the Q4_0 data to a full-precision `Tensor<Wgpu, 2>`.
     ///
-    /// This reads the raw bytes back from GPU and dequantizes on CPU.
+    /// Reads raw bytes from GPU and dequantizes on CPU.
     /// Intended for diagnostics and testing — the hot path uses
     /// [`q4_matmul`](super::op::q4_matmul) which dequantizes on GPU.
-    pub fn dequantize(&self) -> Tensor<Wgpu, 2> {
+    pub fn dequantize(&self) -> burn::tensor::Tensor<burn::backend::Wgpu, 2> {
+        use burn::tensor::{Tensor, TensorData};
+
         let bytes = self.client.read_one(self.handle.clone());
         let raw: &[u8] = &bytes;
 
@@ -125,5 +137,13 @@ impl Q4Tensor {
 
         let tensor_data = TensorData::new(output, [n, k]);
         Tensor::from_data(tensor_data, &self.device)
+    }
+}
+
+/// WASM path: dequantize not available (no direct GPU readback in browsers).
+#[cfg(target_family = "wasm")]
+impl Q4Tensor<burn::backend::wgpu::WgpuRuntime> {
+    pub fn dequantize(&self) -> burn::tensor::Tensor<burn::backend::Wgpu, 2> {
+        panic!("Q4Tensor::dequantize not available on WASM")
     }
 }

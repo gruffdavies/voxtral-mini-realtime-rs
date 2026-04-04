@@ -17,14 +17,10 @@ Goal: Replace hardcoded `Wgpu` throughout `src/gguf/` with `<R: CubeRuntime, B: 
 - Build: `cargo build --bin voxtral --features "wgpu,cli,native-tokenizer,cuda"`
 - Test: `./target/release/voxtral speak --device cuda --text "hi"` → prints CUDA device info, bail with "smoke test passed"
 
-### Phase 2 — Rewrite op.rs kernels with `cube!` macro 🔄 In progress
+### Phase 2 — Rewrite op.rs kernels with `cube!` macro ✅ Complete
 
 **Goal:** Replace the `SourceKernel` WGSL dispatch in `src/gguf/op.rs` with `#[cube(launch)]` kernels.  
 No type signature changes in this phase. WGPU output must be bit-identical.
-
-**What the old code did:**
-- `Q4MatmulNaiveKernel` / `Q4MatmulTiledKernel`: structs implementing `KernelSource`, returning raw WGSL via `include_str!("shader.wgsl")`
-- `dispatch()` / `dispatch_naive()`: called `client.launch(Box::new(SourceKernel::new(...)), ...)`
 
 **What the new code does:**
 - `read_u32_unaligned` helper: `#[cube]` fn, reads u32 at byte-unaligned offset (matches WGSL helper)
@@ -38,42 +34,61 @@ No type signature changes in this phase. WGPU output must be bit-identical.
 - `sync_cube()` = workgroup barrier
 - `ABSOLUTE_POS_X`, `ABSOLUTE_POS_Y` are `u32`; `UNIT_POS_X` is `u32`
 - `terminate!()` instead of `return` (early exit in cube kernels)
-- `&Array<T>` for read inputs, `&mut Array<T>` for write outputs (all → `read_write` in WGSL)
+- `&mut Array<T>` for ALL array params (even read-only; all GPU storage buffers are `read_write`)
 - `f32::reinterpret::<u32>(bits)` for bitcast
 - `#[comptime]` params passed as Rust values in `::launch(...)` call
 - `ArrayArg::from_raw_parts::<T>(&handle, len, 1)` to wrap raw handles
 
-**Compilation errors found and being fixed:**
-1. `return` not allowed → use `terminate!()` 
-2. `tile_k as u32 < big_k` — `<` parsed as generic args — fix: `(tile_k as u32) < big_k`
-3. Secondary "cannot index" errors cascade from #1 and #2
-
-**Current state:** ✅ Kernel compiles, all 231 tests pass, end-to-end TTS is running.
-
 **Verified:**
 - `cargo build --features "wgpu,cli,native-tokenizer"` → clean build
-- `cargo test --features "wgpu,native-tokenizer"` → 231 unit + 4 integration tests all pass
-- End-to-end TTS run: model loads, Q4 backbone runs (our kernel), FM transformer autotuning begins → kernel is working
-- Also applied llvmpipe patches to this worktree: `load_deferred`+`finalize` in speak.rs, stub lm_head in tts_loader.rs
+- `cargo test --features "wgpu,native-tokenizer"` → 231 unit + 4 integration tests pass
+- End-to-end TTS run: model loads, Q4 backbone runs (our kernel), FM transformer autotuning begins
 
-**Not yet confirmed:** audio output quality vs. original WGSL kernels (llvmpipe first-run autotuning takes 20+ min). Will compare WAV files once the run completes, or skip and test directly on CUDA in Phase 4.
+### Phase 3 — Generics plumbing ✅ Complete
 
-### Phase 3 — Generics plumbing ⏳ Blocked on Phase 2
+**Goal:** Add `<R: CubeRuntime, B: Backend<FloatTensorPrimitive = CubeTensor<R>, Device = R::Device>>`
+through all `src/gguf/` files so the pipeline compiles for any CubeCL-backed Burn backend.
 
-Add `<R: CubeRuntime, B: Backend<FloatElem=f32>>` through:
-- `src/gguf/tensor.rs` (129 lines, low risk)
-- `src/gguf/linear.rs` (117 lines, low risk)
-- `src/gguf/model.rs` (~1083 lines, medium)
-- `src/gguf/tts_model.rs` (~700 lines, medium)
-- `src/gguf/tts_loader.rs` (~861 lines, medium)
-- `src/gguf/loader.rs`
+**Key design decisions:**
+- Used `B: Backend<FloatTensorPrimitive = CubeTensor<R>, Device = R::Device>` to express that the device types must match (true for all CubeCL backends: `Wgpu::Device = WgpuRuntime::Device = WgpuDevice`, etc.)
+- Added `PhantomData<B>` marker to `Q4FusedQKV` and `Q4FusedGateUp` (no tensor field uses `B` directly)
+- I/O reader type renamed `Rdr: Read + Seek` in loaders (avoids collision with `R: CubeRuntime`)
+- Loader methods take separate `<Rt, B>` type params: `loader.load::<WgpuRuntime, Wgpu>(&device)`
+- `fuse_qkv` / `fuse_gate_up` device param changed from `&WgpuDevice` to `&R::Device`
+- `Q4LanguageModel::device` field changed from `WgpuDevice` to `R::Device`
 
-### Phase 4 — CUDA end-to-end and benchmark ⏳ Blocked on Phase 3
+**Files changed:**
+- `src/gguf/tensor.rs` — `Q4Tensor<R: CubeRuntime>` (done in earlier context)
+- `src/gguf/linear.rs` — `Q4Linear<R, B>`, `Q4FusedQKV<R, B>`, `Q4FusedGateUp<R, B>`
+- `src/gguf/model.rs` — all structs and impls, ~1083 lines rewritten
+- `src/gguf/tts_model.rs` — all structs and impls, ~700 lines rewritten
+- `src/gguf/loader.rs` — `Q4ModelParts<Rt,B>`, all load methods generic
+- `src/gguf/tts_loader.rs` — `Q4TtsModelParts<Rt,B>`, all load methods generic
+- `src/bin/voxtral/transcribe.rs` — `Q4VoxtralModel<WgpuRuntime, Backend>` concrete types
+- `src/bin/voxtral/speak.rs` — `load_deferred::<WgpuRuntime, Wgpu>` explicit type args
+- `src/gguf/tests.rs` — `TestRuntime = WgpuRuntime`, explicit closure return types
 
-- Wire `--device cuda` through the full Q4 pipeline
+**Verified:**
+- `cargo build --features "wgpu,cli,native-tokenizer"` → clean (4 minor warnings)
+- `cargo build --features "wgpu,cli,native-tokenizer,cuda"` → clean (CUDA path compiles too)
+- `cargo test --features "wgpu,native-tokenizer"` → **239 tests pass** (231 unit + 4 integration + 3 tts_model + 1 tts integration)
+
+### Phase 4 — CUDA end-to-end and benchmark ⏳ Next
+
+**Goal:**
+- Replace the `run_cuda()` smoke test bail with actual Q4 inference using `CudaRuntime + Cuda`
+- Determine the `CudaRuntime` type (likely `burn::backend::cuda::CudaRuntime`)
+- Make `run_q4()` generic or add a CUDA variant
 - Run `uv run main.py "Hello world" --device cuda`
 - Benchmark RTF vs llvmpipe baseline (~200×)
 - Target: real-time or better on RTX 4090
+
+**What needs to happen:**
+1. Import `burn::backend::cuda::CudaRuntime` (check exact path from burn 0.20 docs)
+2. Update `run_cuda()` in `speak.rs` to call `loader.load_deferred::<CudaRuntime, Cuda>(&device)`
+3. Verify `Q4TtsModelParts::finalize()` + `backbone.generate_async()` work on CUDA
+4. Check if any `Wgpu`-specific code remains (e.g. `AudioCodebookEmbeddings<Wgpu>` in speak.rs)
+5. Add `--device cuda` support to the Python wrapper `main.py`
 
 ---
 
@@ -82,15 +97,14 @@ Add `<R: CubeRuntime, B: Backend<FloatElem=f32>>` through:
 | File | Status | Notes |
 |---|---|---|
 | `Cargo.toml` | ✅ Done | `cuda` feature added |
-| `src/bin/voxtral/speak.rs` | ✅ Done | `--device` flag, `run_cuda` smoke test |
-| `src/gguf/op.rs` | 🔄 In progress | `cube!` kernels replacing WGSL dispatch |
-| `src/gguf/shader.wgsl` | Kept as reference | Tiled kernel logic source |
-| `src/gguf/shader_naive.wgsl` | Kept as reference | Naive kernel logic source |
-| `src/gguf/tensor.rs` | ⏳ Pending | Add `<R: CubeRuntime>` |
-| `src/gguf/linear.rs` | ⏳ Pending | Add `<R, B>` |
-| `src/gguf/model.rs` | ⏳ Pending | Add `<R, B>` |
-| `src/gguf/tts_model.rs` | ⏳ Pending | Add `<R, B>` |
-| `src/gguf/tts_loader.rs` | ⏳ Pending | Add `<R, B>` |
+| `src/bin/voxtral/speak.rs` | 🔄 Phase 4 | WGPU path done; CUDA path still smoke-test bail |
+| `src/gguf/op.rs` | ✅ Done | `cube!` kernels, generic dispatch functions |
+| `src/gguf/tensor.rs` | ✅ Done | `Q4Tensor<R: CubeRuntime>` |
+| `src/gguf/linear.rs` | ✅ Done | `Q4Linear<R, B>` etc. |
+| `src/gguf/model.rs` | ✅ Done | All model structs generic |
+| `src/gguf/tts_model.rs` | ✅ Done | All TTS model structs generic |
+| `src/gguf/tts_loader.rs` | ✅ Done | `Q4TtsModelParts<Rt,B>`, generic loaders |
+| `src/gguf/loader.rs` | ✅ Done | `Q4ModelParts<Rt,B>`, generic loaders |
 
 ---
 
@@ -106,4 +120,23 @@ cargo build --bin voxtral --features "wgpu,cli,native-tokenizer,cuda"
 
 # Run tests
 cargo test --features "wgpu,native-tokenizer"
+
+# TTS inference (WGPU)
+uv run main.py "Hello world"
 ```
+
+---
+
+## Appendix: CubeCL 0.9 Kernel API Quick Reference
+
+| CubeCL | Equivalent |
+|---|---|
+| `terminate!()` | `return` in kernel |
+| `sync_cube()` | workgroup barrier |
+| `ABSOLUTE_POS_X` | global thread X (u32) |
+| `UNIT_POS_X` | local thread X (u32) |
+| `SharedMemory::<f32>::new(#[comptime] N)` | workgroup shared memory |
+| `f32::reinterpret::<u32>(bits)` | bitcast f32 → u32 |
+| `&mut Array<T>` | all GPU array params (always read_write) |
+| `ArrayArg::from_raw_parts::<T>(&handle, len, 1)` | wrap raw handle for launch |
+| `#[comptime] n: u32` | compile-time constant param |

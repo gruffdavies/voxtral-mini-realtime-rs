@@ -1,6 +1,7 @@
 //! `voxtral transcribe` subcommand — speech-to-text.
 
 use anyhow::{bail, Context, Result};
+use burn::backend::wgpu::WgpuRuntime;
 use burn::backend::Wgpu;
 use burn::prelude::ElementConversion;
 use burn::tensor::Tensor;
@@ -138,7 +139,7 @@ enum ModelState {
         model: voxtral_mini_realtime::models::voxtral::VoxtralModel<Backend>,
     },
     Q4 {
-        model: voxtral_mini_realtime::gguf::model::Q4VoxtralModel,
+        model: voxtral_mini_realtime::gguf::model::Q4VoxtralModel<WgpuRuntime, Backend>,
     },
 }
 
@@ -155,7 +156,7 @@ fn load_model(
         let start = Instant::now();
         info!("Loading Q4 GGUF model from {}", path.display());
         let mut loader = Q4ModelLoader::from_file(&path).context("Failed to open GGUF")?;
-        let model = loader.load(device).context("Failed to load Q4 model")?;
+        let model = loader.load::<WgpuRuntime, Backend>(device).context("Failed to load Q4 model")?;
         info!(
             elapsed_ms = start.elapsed().as_millis() as u64,
             "Q4 model loaded"
