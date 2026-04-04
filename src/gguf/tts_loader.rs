@@ -53,16 +53,20 @@ pub struct Q4TtsModelParts {
 impl Q4TtsModelParts {
     /// Assemble the final model components with Q4 token embeddings.
     ///
-    /// Keeps embeddings as Q4 on GPU (~216 MB) for the lm_head, with a CPU
-    /// copy for embed_tokens row lookups.
+    /// For TTS inference, `lm_head` is never called (TTS generates audio tokens
+    /// via the FM transformer, not text tokens via the vocabulary head).
+    /// We therefore create a tiny 32×1 stub Q4 tensor for lm_head instead of the
+    /// full 226 MB embedding table, keeping only cpu_bytes for embed_tokens lookups.
     pub fn finalize(self) -> Result<(Q4TtsBackbone, Q4FmTransformer, CodecDecoder<Wgpu>)> {
-        let [vocab, d_model] = self.tok_embed_shape;
-
-        let tok_embed_q4 =
-            Q4Tensor::from_q4_bytes(&self.tok_embed_q4_bytes, [vocab, d_model], &self.device)?;
+        // One minimal Q4_0 block (32 elements = 18 bytes) as a stub for lm_head.
+        // Shape is [32, 1]; lm_head is never called during TTS generation.
+        let stub_bytes = vec![0u8; 18];
+        let tok_embed_stub =
+            Q4Tensor::from_q4_bytes(&stub_bytes, [32, 1], &self.device)
+                .context("Failed to create stub Q4 tensor for TTS lm_head")?;
 
         let tok_embeddings = TokEmbedStore::Q4 {
-            lm_head: super::linear::Q4Linear::new(tok_embed_q4, None),
+            lm_head: super::linear::Q4Linear::new(tok_embed_stub, None),
             cpu_bytes: self.tok_embed_q4_bytes,
         };
 

@@ -246,7 +246,13 @@ fn run_q4(
     let start = Instant::now();
     info!("Loading Q4 TTS model from {}", path.display());
     let mut loader = Q4TtsModelLoader::from_file(&path).context("Failed to open GGUF")?;
-    let (backbone, mut fm, codec) = loader.load(device).context("Failed to load Q4 model")?;
+    // Use load_deferred+finalize to keep token embeddings as Q4 (~216 MB) rather
+    // than dequantizing to f32 (~1.5 GB). Works on GPU and CPU/software renderers.
+    let (backbone, mut fm, codec) = loader
+        .load_deferred(device)
+        .context("Failed to load Q4 model")?
+        .finalize()
+        .context("Failed to finalize Q4 model")?;
     fm.set_euler_steps(args.euler_steps);
     info!(
         elapsed_ms = start.elapsed().as_millis() as u64,

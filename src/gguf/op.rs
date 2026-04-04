@@ -1,30 +1,29 @@
 //! Fused Q4_0 dequant+matmul GPU kernel launch.
 //!
-//! [`q4_matmul`] launches a WGSL compute shader to perform
+//! [`q4_matmul`] dispatches a CubeCL compute kernel to perform
 //! `output[B, M, N] = input[B, M, K] × weights[N, K]^T` where weights are in
 //! Q4_0 format with shape `[N, K]` (out_features, in_features).
 //!
 //! Two kernel variants are dispatched based on M:
-//! - **M ≤ threshold**: Tiled kernel with shared memory (shader.wgsl).
+//! - **M ≤ threshold**: Tiled kernel with shared memory.
 //!   Cooperatively loads the input vector into workgroup shared memory,
 //!   eliminating redundant global reads. Uses 1D (128,1,1) workgroups.
-//! - **M > threshold**: Naive kernel (shader_naive.wgsl).
+//! - **M > threshold**: Naive kernel.
 //!   One thread per output element with (16,16) workgroups — better for
 //!   multi-row matmuls where the 2D layout fills the GPU efficiently.
 //!
-//! On WASM/WebGPU, only the naive kernel is used because of a CubeCL bind
-//! group layout issue: switching between tiled and naive shaders within the
-//! same session produces incorrect results.
+//! On WASM/WebGPU, only the naive kernel is used.
+//!
+//! Kernels are written using the CubeCL `#[cube(launch)]` macro, which
+//! compiles the same source to WGSL (for wgpu) and PTX (for CUDA), making
+//! this the portability layer for the Q4 path.
 
-use burn::backend::wgpu::{
-    into_contiguous, AutoCompiler, CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate,
-    WgpuRuntime,
-};
+use burn::backend::wgpu::{into_contiguous, CubeTensor, WgpuRuntime};
 use burn::backend::Wgpu;
 use burn::tensor::{DType, Tensor, TensorPrimitive};
-use cubecl::prelude::KernelId;
-use cubecl::server::{Bindings, CubeCount};
-use cubecl::CubeTask;
+use cubecl::client::ComputeClient;
+use cubecl::prelude::*;
+use cubecl::server::Handle;
 
 use super::tensor::Q4Tensor;
 
@@ -32,63 +31,269 @@ use super::tensor::Q4Tensor;
 #[cfg(not(target_family = "wasm"))]
 const TILED_M_THRESHOLD: usize = 4;
 
-// -- Tiled kernel (shared memory, good for M=1 decode) --
+/// Workgroup size X for the tiled kernel (1D workgroups).
+const TILED_WG_X: usize = 128;
+
+/// Tile size for K-dimension shared memory (must be a multiple of 32).
+const TILE_K: usize = 512;
+
+/// Workgroup size X for the naive kernel (2D workgroups).
+const NAIVE_WG_X: usize = 16;
+
+/// Workgroup size Y for the naive kernel (2D workgroups).
+const NAIVE_WG_Y: usize = 16;
+
+// ---------------------------------------------------------------------------
+// CubeCL kernel helper functions
+// ---------------------------------------------------------------------------
+
+/// Read a u32 from the weights buffer at an arbitrary byte offset.
+///
+/// Q4_0 blocks are 18 bytes, not aligned to 4 bytes, so we stitch two
+/// adjacent u32 words when the byte offset is not word-aligned.
+#[cube]
+fn read_u32_unaligned(weights: &mut Array<u32>, byte_offset: u32) -> u32 {
+    let word = byte_offset >> 2u32;
+    let shift = (byte_offset & 3u32) << 3u32;
+    if shift == 0u32 {
+        weights[word as usize]
+    } else {
+        (weights[word as usize] >> shift) | (weights[(word + 1u32) as usize] << (32u32 - shift))
+    }
+}
+
+/// Convert the lower 16 bits of a u32 (an f16 bit pattern) to an f32.
+///
+/// Uses manual bit manipulation to reconstruct the f32 representation:
+///   f32_exp = f16_exp + 112  (bias difference: 127 − 15 = 112)
+///   f32_frac = f16_frac shifted left by 13 bits
+///
+/// This handles all normal f16 values, which is the only kind that appears
+/// as a Q4_0 block scale in practice.
+#[cube]
+fn f16_bits_to_f32(bits: u32) -> f32 {
+    let sign = (bits >> 15u32) & 1u32;
+    let exp = (bits >> 10u32) & 0x1Fu32;
+    let frac = bits & 0x3FFu32;
+    // Rebuild an f32 bit pattern from the f16 components.
+    // For exp == 0 (subnormal f16) this overflows into a normal f32, but
+    // Q4_0 scales are always normal values so this is acceptable.
+    let f32_bits = (sign << 31u32) | ((exp + 112u32) << 23u32) | (frac << 13u32);
+    f32::reinterpret::<u32>(f32_bits)
+}
+
+// ---------------------------------------------------------------------------
+// Naive kernel: one thread per output element
+// ---------------------------------------------------------------------------
+//
+// Grid: ceil(N / NAIVE_WG_X) × ceil(B*M / NAIVE_WG_Y) cubes,
+//       each cube is (NAIVE_WG_X, NAIVE_WG_Y, 1).
+//
+// Thread (gid.x, gid.y) computes output[b, m, n] where:
+//   n   = gid.x
+//   bm  = gid.y  (= b * M + m)
+
+#[cube(launch)]
+fn q4_matmul_naive(
+    weights: &mut Array<u32>,
+    input: &mut Array<f32>,
+    output: &mut Array<f32>,
+    info: &mut Array<u32>,
+) {
+    let n = ABSOLUTE_POS_X;
+    let bm = ABSOLUTE_POS_Y;
+
+    let big_b = info[0usize];
+    let big_m = info[1usize];
+    let big_k = info[2usize];
+    let big_n = info[3usize];
+    let blocks_per_row = info[4usize];
+
+    let row_m = bm % big_m;
+    let b = bm / big_m;
+
+    if n >= big_n || b >= big_b {
+        terminate!();
+    }
+
+    let mut acc = 0.0f32;
+    let input_base = b * big_m * big_k + row_m * big_k;
+
+    for blk in 0u32..blocks_per_row {
+        let global_block = n * blocks_per_row + blk;
+        let block_byte = global_block * 18u32;
+        let scale_bits = read_u32_unaligned(weights, block_byte) & 0xFFFFu32;
+        let scale = f16_bits_to_f32(scale_bits);
+        let k_base = blk * 32u32;
+        let data_start = block_byte + 2u32;
+
+        for wi in 0u32..4u32 {
+            let packed = read_u32_unaligned(weights, data_start + wi * 4u32);
+            let b0 = packed & 0xFFu32;
+            let b1 = (packed >> 8u32) & 0xFFu32;
+            let b2 = (packed >> 16u32) & 0xFFu32;
+            let b3 = (packed >> 24u32) & 0xFFu32;
+
+            let base_i = wi * 4u32;
+            let k_off = (input_base + k_base + base_i) as usize;
+
+            // Lower nibbles → elements [base_i .. base_i+3]
+            acc += ((b0 & 0xFu32) as f32 - 8.0f32) * scale * input[k_off];
+            acc += ((b1 & 0xFu32) as f32 - 8.0f32) * scale * input[k_off + 1usize];
+            acc += ((b2 & 0xFu32) as f32 - 8.0f32) * scale * input[k_off + 2usize];
+            acc += ((b3 & 0xFu32) as f32 - 8.0f32) * scale * input[k_off + 3usize];
+
+            // Upper nibbles → elements [16 + base_i .. 16 + base_i+3]
+            let k_off_hi = k_off + 16usize;
+            acc += (((b0 >> 4u32) & 0xFu32) as f32 - 8.0f32) * scale * input[k_off_hi];
+            acc += (((b1 >> 4u32) & 0xFu32) as f32 - 8.0f32) * scale * input[k_off_hi + 1usize];
+            acc += (((b2 >> 4u32) & 0xFu32) as f32 - 8.0f32) * scale * input[k_off_hi + 2usize];
+            acc += (((b3 >> 4u32) & 0xFu32) as f32 - 8.0f32) * scale * input[k_off_hi + 3usize];
+        }
+    }
+
+    output[(b * big_m * big_n + row_m * big_n + n) as usize] = acc;
+}
+
+// ---------------------------------------------------------------------------
+// Tiled kernel: 128-thread workgroups cooperatively load input into shared memory
+// ---------------------------------------------------------------------------
+//
+// Grid: ceil(N / TILED_WG_X) × (B*M) cubes, each cube is (TILED_WG_X, 1, 1).
+//
+// All 128 threads in a cube load a TILE_K-sized slice of the input row into
+// shared memory before each accumulates against its own weight row. This
+// eliminates redundant global memory reads for M=1 (autoregressive decode).
+//
+// The `valid` flag ensures all threads reach sync_cube() even when b ≥ B
+// (out-of-bounds cube in the Y direction is possible when B*M is not a
+// multiple of the Y grid stride — in the 1D Y case it never is, but left
+// here for safety parity with the WGSL original).
 
 #[cfg(not(target_family = "wasm"))]
-const TILED_WG_X: u32 = 128;
+#[cube(launch)]
+fn q4_matmul_tiled(
+    weights: &mut Array<u32>,
+    input: &mut Array<f32>,
+    output: &mut Array<f32>,
+    info: &mut Array<u32>,
+    #[comptime] tile_k: usize,
+    #[comptime] wg_size: usize,
+) {
+    let mut shared_input = SharedMemory::<f32>::new(tile_k);
 
-#[cfg(not(target_family = "wasm"))]
-struct Q4MatmulTiledKernel {
-    workgroup_size_x: u32,
-}
+    let n = ABSOLUTE_POS_X;
+    let bm = ABSOLUTE_POS_Y;
 
-#[cfg(not(target_family = "wasm"))]
-impl KernelSource for Q4MatmulTiledKernel {
-    fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("shader.wgsl"))
-            .register("workgroup_size_x", self.workgroup_size_x.to_string())
+    let big_b = info[0usize];
+    let big_m = info[1usize];
+    let big_k = info[2usize];
+    let big_n = info[3usize];
+    let blocks_per_row = info[4usize];
+
+    let row_m = bm % big_m;
+    let b = bm / big_m;
+
+    // `valid` prevents early returns that would skip sync_cube() calls.
+    let valid = b < big_b;
+    let mut acc = 0.0f32;
+    // When !valid (b >= B), input_base may be out of bounds but is never used
+    // because the cooperative load and accumulate loops are guarded by `valid`.
+    let input_base = b * big_m * big_k + row_m * big_k;
+
+    let num_tiles = (big_k + tile_k as u32 - 1u32) / tile_k as u32;
+
+    for tile in 0u32..num_tiles {
+        let tile_start = tile * tile_k as u32;
+
+        // Cooperative load: all threads fill their slice of shared_input.
+        let mut k_local = UNIT_POS_X as usize;
+        while k_local < tile_k {
+            let k_global = tile_start as usize + k_local;
+            if valid && k_global < big_k as usize {
+                shared_input[k_local] = input[input_base as usize + k_global];
+            }
+            k_local += wg_size;
+        }
+        sync_cube();
+
+        // Accumulate against shared input.
+        if valid && n < big_n {
+            let tile_end = if tile_start + (tile_k as u32) < big_k {
+                tile_start + (tile_k as u32)
+            } else {
+                big_k
+            };
+            let blocks_in_tile = (tile_end - tile_start) / 32u32;
+            let block_base = tile_start / 32u32;
+
+            for blk in 0u32..blocks_in_tile {
+                let global_block = n * blocks_per_row + block_base + blk;
+                let block_byte = global_block * 18u32;
+                let scale_bits = read_u32_unaligned(weights, block_byte) & 0xFFFFu32;
+                let scale = f16_bits_to_f32(scale_bits);
+                let k_base = (blk * 32u32) as usize;
+                let data_start = block_byte + 2u32;
+
+                for wi in 0u32..4u32 {
+                    let packed = read_u32_unaligned(weights, data_start + wi * 4u32);
+                    let b0 = packed & 0xFFu32;
+                    let b1 = (packed >> 8u32) & 0xFFu32;
+                    let b2 = (packed >> 16u32) & 0xFFu32;
+                    let b3 = (packed >> 24u32) & 0xFFu32;
+
+                    let base_i = (wi * 4u32) as usize;
+                    let sm_off = k_base + base_i;
+
+                    // Lower nibbles → shared_input[k_base + base_i .. +3]
+                    acc +=
+                        ((b0 & 0xFu32) as f32 - 8.0f32) * scale * shared_input[sm_off];
+                    acc +=
+                        ((b1 & 0xFu32) as f32 - 8.0f32) * scale * shared_input[sm_off + 1usize];
+                    acc +=
+                        ((b2 & 0xFu32) as f32 - 8.0f32) * scale * shared_input[sm_off + 2usize];
+                    acc +=
+                        ((b3 & 0xFu32) as f32 - 8.0f32) * scale * shared_input[sm_off + 3usize];
+
+                    // Upper nibbles → shared_input[k_base + 16 + base_i .. +3]
+                    let sm_off_hi = sm_off + 16usize;
+                    acc += (((b0 >> 4u32) & 0xFu32) as f32 - 8.0f32)
+                        * scale
+                        * shared_input[sm_off_hi];
+                    acc += (((b1 >> 4u32) & 0xFu32) as f32 - 8.0f32)
+                        * scale
+                        * shared_input[sm_off_hi + 1usize];
+                    acc += (((b2 >> 4u32) & 0xFu32) as f32 - 8.0f32)
+                        * scale
+                        * shared_input[sm_off_hi + 2usize];
+                    acc += (((b3 >> 4u32) & 0xFu32) as f32 - 8.0f32)
+                        * scale
+                        * shared_input[sm_off_hi + 3usize];
+                }
+            }
+        }
+        sync_cube();
     }
 
-    fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info(self.workgroup_size_x)
+    if n < big_n && b < big_b {
+        output[(b * big_m * big_n + row_m * big_n + n) as usize] = acc;
     }
 }
 
-// -- Naive kernel (one thread per element, good for M>1 prefill/encoder) --
-
-const NAIVE_WG_X: u32 = 16;
-const NAIVE_WG_Y: u32 = 16;
-
-struct Q4MatmulNaiveKernel {
-    workgroup_size_x: u32,
-    workgroup_size_y: u32,
-}
-
-impl KernelSource for Q4MatmulNaiveKernel {
-    fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("shader_naive.wgsl"))
-            .register("workgroup_size_x", self.workgroup_size_x.to_string())
-            .register("workgroup_size_y", self.workgroup_size_y.to_string())
-    }
-
-    fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info(self.workgroup_size_x * 1000 + self.workgroup_size_y)
-    }
-}
+// ---------------------------------------------------------------------------
+// Public interface
+// ---------------------------------------------------------------------------
 
 /// Fused Q4_0 dequant+matmul on GPU.
 ///
-/// Computes `output[B, M, N] = input[B, M, K] × weights[N, K]^T` where weights
-/// are stored in Q4_0 block format on the GPU with shape `[N, K]`
-/// (out_features, in_features), matching PyTorch/GGUF convention.
-/// Dequantization happens inside the compute shader — no intermediate
-/// full-precision weight buffer is created.
+/// Computes `output[B, M, N] = input[B, M, K] × weights[N, K]^T` where
+/// weights are stored in Q4_0 block format on the GPU with shape `[N, K]`
+/// (out_features, in_features). Dequantization happens inside the kernel —
+/// no intermediate full-precision weight buffer is created.
 pub fn q4_matmul(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> {
-    // Convert Tensor → CubeTensor and ensure contiguous layout
     let cube_input: CubeTensor<WgpuRuntime> = input.into_primitive().tensor();
     let cube_input = into_contiguous(cube_input);
 
-    // Extract dimensions
     assert_eq!(cube_input.shape.num_dims(), 3, "Input must be 3D [B, M, K]");
     let b = cube_input.shape.dims[0];
     let m = cube_input.shape.dims[1];
@@ -103,10 +308,8 @@ pub fn q4_matmul(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> 
     let device = cube_input.device.clone();
     let blocks_per_row = k / 32;
 
-    // Allocate output buffer (B × M × N × 4 bytes for f32)
     let output_handle = client.empty(b * m * n * 4);
 
-    // Info buffer: [B, M, K, N, blocks_per_row] — shared by both kernel variants
     let info: [u32; 5] = [
         b as u32,
         m as u32,
@@ -117,15 +320,23 @@ pub fn q4_matmul(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> 
     let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
     let info_handle = client.create_from_slice(&info_bytes);
 
-    let bindings = Bindings::new()
-        .with_buffer(weights.handle.clone().binding())
-        .with_buffer(cube_input.handle.clone().binding())
-        .with_buffer(output_handle.clone().binding())
-        .with_buffer(info_handle.binding());
+    // Weights buffer length in u32 elements (padded to 4-byte alignment in Q4Tensor).
+    let weights_u32_len = (weights.num_blocks() * 18).div_ceil(4);
 
-    dispatch(&client, b, m, n, bindings);
+    dispatch(
+        &client,
+        b,
+        m,
+        n,
+        &weights.handle,
+        weights_u32_len,
+        &cube_input.handle,
+        b * m * k,
+        &output_handle,
+        b * m * n,
+        &info_handle,
+    );
 
-    // Wrap output handle in a CubeTensor → Tensor
     let output_tensor = CubeTensor::new_contiguous(
         client,
         device,
@@ -138,69 +349,113 @@ pub fn q4_matmul(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> 
 
 /// Dispatch the appropriate kernel variant.
 ///
-/// On native: tiled for M ≤ 4 (decoder), naive for M > 4 (encoder/prefill).
-/// On WASM: always naive to avoid CubeCL bind group layout issues.
+/// On native: tiled for M ≤ TILED_M_THRESHOLD, naive otherwise.
+/// On WASM: always naive.
 #[cfg(not(target_family = "wasm"))]
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
-    client: &cubecl::client::ComputeClient<WgpuRuntime>,
+    client: &ComputeClient<WgpuRuntime>,
     b: usize,
     m: usize,
     n: usize,
-    bindings: Bindings,
+    weights_handle: &Handle,
+    weights_u32_len: usize,
+    input_handle: &Handle,
+    input_len: usize,
+    output_handle: &Handle,
+    output_len: usize,
+    info_handle: &Handle,
 ) {
     if m <= TILED_M_THRESHOLD {
-        let kernel = SourceKernel::new(
-            Q4MatmulTiledKernel {
-                workgroup_size_x: TILED_WG_X,
-            },
-            CubeDim::new_1d(TILED_WG_X),
-        );
-        let wg_x = n.div_ceil(TILED_WG_X as usize) as u32;
+        let wg_x = n.div_ceil(TILED_WG_X) as u32;
         let wg_y = (b * m) as u32;
-        client
-            .launch(
-                Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+        unsafe {
+            q4_matmul_tiled::launch(
+                client,
                 CubeCount::new_2d(wg_x, wg_y),
-                bindings,
+                CubeDim::new_1d(TILED_WG_X as u32),
+                ArrayArg::from_raw_parts::<u32>(weights_handle, weights_u32_len, 1),
+                ArrayArg::from_raw_parts::<f32>(input_handle, input_len, 1),
+                ArrayArg::from_raw_parts::<f32>(output_handle, output_len, 1),
+                ArrayArg::from_raw_parts::<u32>(info_handle, 5, 1),
+                TILE_K,
+                TILED_WG_X,
             )
             .expect("Q4 tiled matmul kernel launch failed");
+        }
     } else {
-        dispatch_naive(client, b, m, n, bindings);
+        dispatch_naive(
+            client,
+            b,
+            m,
+            n,
+            weights_handle,
+            weights_u32_len,
+            input_handle,
+            input_len,
+            output_handle,
+            output_len,
+            info_handle,
+        );
     }
 }
 
 #[cfg(target_family = "wasm")]
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
-    client: &cubecl::client::ComputeClient<WgpuRuntime>,
+    client: &ComputeClient<WgpuRuntime>,
     b: usize,
     m: usize,
     n: usize,
-    bindings: Bindings,
+    weights_handle: &Handle,
+    weights_u32_len: usize,
+    input_handle: &Handle,
+    input_len: usize,
+    output_handle: &Handle,
+    output_len: usize,
+    info_handle: &Handle,
 ) {
-    dispatch_naive(client, b, m, n, bindings);
+    dispatch_naive(
+        client,
+        b,
+        m,
+        n,
+        weights_handle,
+        weights_u32_len,
+        input_handle,
+        input_len,
+        output_handle,
+        output_len,
+        info_handle,
+    );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_naive(
-    client: &cubecl::client::ComputeClient<WgpuRuntime>,
+    client: &ComputeClient<WgpuRuntime>,
     b: usize,
     m: usize,
     n: usize,
-    bindings: Bindings,
+    weights_handle: &Handle,
+    weights_u32_len: usize,
+    input_handle: &Handle,
+    input_len: usize,
+    output_handle: &Handle,
+    output_len: usize,
+    info_handle: &Handle,
 ) {
-    let kernel = SourceKernel::new(
-        Q4MatmulNaiveKernel {
-            workgroup_size_x: NAIVE_WG_X,
-            workgroup_size_y: NAIVE_WG_Y,
-        },
-        CubeDim::new_2d(NAIVE_WG_X, NAIVE_WG_Y),
-    );
-    let wg_x = n.div_ceil(NAIVE_WG_X as usize) as u32;
-    let wg_y = (b * m).div_ceil(NAIVE_WG_Y as usize) as u32;
-    client
-        .launch(
-            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+    let wg_x = n.div_ceil(NAIVE_WG_X) as u32;
+    let wg_y = (b * m).div_ceil(NAIVE_WG_Y) as u32;
+    unsafe {
+        q4_matmul_naive::launch(
+            client,
             CubeCount::new_2d(wg_x, wg_y),
-            bindings,
+            CubeDim::new_2d(NAIVE_WG_X as u32, NAIVE_WG_Y as u32),
+            ArrayArg::from_raw_parts::<u32>(weights_handle, weights_u32_len, 1),
+            ArrayArg::from_raw_parts::<f32>(input_handle, input_len, 1),
+            ArrayArg::from_raw_parts::<f32>(output_handle, output_len, 1),
+            ArrayArg::from_raw_parts::<u32>(info_handle, 5, 1),
         )
         .expect("Q4 naive matmul kernel launch failed");
+    }
 }
