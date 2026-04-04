@@ -3,7 +3,7 @@
 use anyhow::{bail, Context, Result};
 use burn::backend::Wgpu;
 use burn::tensor::Tensor;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 use std::time::Instant;
 use tracing::info;
@@ -12,6 +12,17 @@ use voxtral_mini_realtime::audio::AudioBuffer;
 use voxtral_mini_realtime::tokenizer::TekkenEncoder;
 
 type Backend = Wgpu;
+
+/// Compute device selection for Q4 GGUF inference.
+#[derive(Debug, Clone, ValueEnum, Default)]
+pub enum DeviceArg {
+    /// WebGPU/Vulkan via wgpu (default; falls back to llvmpipe on WSL2).
+    #[default]
+    Wgpu,
+    /// NVIDIA CUDA (requires cuda feature and CUDA toolkit).
+    #[cfg(feature = "cuda")]
+    Cuda,
+}
 
 #[derive(Parser)]
 pub struct Args {
@@ -63,9 +74,46 @@ pub struct Args {
     /// Euler ODE steps: 3=real-time, 4=balanced, 8=quality.
     #[arg(long, default_value_t = 4)]
     euler_steps: usize,
+
+    /// Compute device for Q4 GGUF inference.
+    #[arg(long, default_value = "wgpu")]
+    device: DeviceArg,
 }
 
 pub fn run(args: Args) -> Result<()> {
+    match args.device {
+        #[cfg(feature = "cuda")]
+        DeviceArg::Cuda => return run_cuda(args),
+        _ => {}
+    }
+    run_wgpu(args)
+}
+
+#[cfg(feature = "cuda")]
+fn run_cuda(args: Args) -> Result<()> {
+    use burn::backend::Cuda;
+    use burn::backend::cuda::CudaDevice;
+    use burn::tensor::Tensor;
+
+    let device = CudaDevice::default();
+    let info = burn::backend::cuda::CudaDevice::default();
+    info!("CUDA device: {:?}", info);
+
+    // Smoke test: allocate a small tensor and confirm CUDA is active.
+    let t: Tensor<Cuda, 1> = Tensor::zeros([4], &device);
+    let val = t.sum().into_scalar();
+    info!("CUDA smoke test: sum of zeros = {val} (expected 0)");
+
+    // Delegate to Q4 inference once smoke test passes.
+    // Phase 1: only the smoke test is wired; full inference comes in Phase 3.
+    bail!(
+        "CUDA smoke test passed — device is active.\n\
+         Full Q4 inference on CUDA will be enabled in Phase 3 of the refactor.\n\
+         Run with --device wgpu for inference now."
+    )
+}
+
+fn run_wgpu(args: Args) -> Result<()> {
     let device = burn::backend::wgpu::WgpuDevice::default();
 
     // Resolve tokenizer

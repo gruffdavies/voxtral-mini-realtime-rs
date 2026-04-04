@@ -10,6 +10,8 @@ authors = ["Trevor Strieber"]
 [features]
 default = ["wgpu", "native-tokenizer"]
 wgpu = ["burn/wgpu"]
+# CUDA backend for native GPU inference (requires CUDA toolkit)
+cuda = ["burn/cuda", "cubecl/cuda"]
 cli = ["clap", "indicatif"]
 hub = ["hf-hub"]
 # Tekken BPE encoding via tiktoken (WASM-compatible, no C deps)
@@ -32,6 +34,8 @@ profiling = ["tracing-chrome"]
 # Burn ML framework - latest version with backend selection via features
 burn = { version = "0.20", default-features = false, features = ["std", "autodiff", "template", "autotune"] }
 cubecl = { version = "0.9", default-features = false, features = ["wgpu"] }
+# CUDA backend (enabled by "cuda" feature)
+burn-cuda = { version = "0.20", optional = true }
 
 # Tekken BPE encoding (tiktoken core, WASM-compatible)
 tiktoken-rs = { version = "0.9", optional = true }
