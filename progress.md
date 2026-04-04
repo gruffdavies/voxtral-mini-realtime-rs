@@ -73,22 +73,27 @@ through all `src/gguf/` files so the pipeline compiles for any CubeCL-backed Bur
 - `cargo build --features "wgpu,cli,native-tokenizer,cuda"` → clean (CUDA path compiles too)
 - `cargo test --features "wgpu,native-tokenizer"` → **239 tests pass** (231 unit + 4 integration + 3 tts_model + 1 tts integration)
 
-### Phase 4 — CUDA end-to-end and benchmark ⏳ Next
+### Phase 4 — CUDA end-to-end and benchmark ✅ Complete
 
-**Goal:**
-- Replace the `run_cuda()` smoke test bail with actual Q4 inference using `CudaRuntime + Cuda`
-- Determine the `CudaRuntime` type (likely `burn::backend::cuda::CudaRuntime`)
-- Make `run_q4()` generic or add a CUDA variant
-- Run `uv run main.py "Hello world" --device cuda`
-- Benchmark RTF vs llvmpipe baseline (~200×)
-- Target: real-time or better on RTX 4090
+**Goal:** Replace the `run_cuda()` smoke test bail with actual Q4 inference, benchmark vs llvmpipe.
 
-**What needs to happen:**
-1. Import `burn::backend::cuda::CudaRuntime` (check exact path from burn 0.20 docs)
-2. Update `run_cuda()` in `speak.rs` to call `loader.load_deferred::<CudaRuntime, Cuda>(&device)`
-3. Verify `Q4TtsModelParts::finalize()` + `backbone.generate_async()` work on CUDA
-4. Check if any `Wgpu`-specific code remains (e.g. `AudioCodebookEmbeddings<Wgpu>` in speak.rs)
-5. Add `--device cuda` support to the Python wrapper `main.py`
+**What was done:**
+- `run_cuda()` already wired to `run_q4::<CudaRuntime, CudaBackend>` from Phase 3 session (discovered on resume)
+- Backend type: `CubeBackend<CudaRuntime, f32, i32, u8>` (non-fusion, satisfies `FloatTensorPrimitive = CubeTensor<R>` constraint)
+- Added `--device cuda` to Python wrapper `main.py`; auto-selects cuda worktree binary
+
+**Benchmark (RTX 4090, WSL2):**
+
+| Run | Text | Duration | RTF |
+|---|---|---|---|
+| Cold (first run, autotuning) | "Hello world" (2 tokens) | 1.2s audio / 79s wall | 65.6× |
+| Warm | "Hello world, this is a test…" (longer) | 7.8s audio / 73s wall | 9.3× |
+| Warm | "Hello world" (2 tokens) | 2.5s audio / 76s wall | 30.3× |
+
+RTF ~9–30× on warm cache (depends on sequence length / amortisation). llvmpipe baseline was ~200×.
+Autotuning is one-time per problem shape; cached in `~/.cache/burn/...` for subsequent runs.
+
+**Note:** Not real-time yet. The Q4 matmul kernel (CubeCL-generated PTX) is not fused with dequantization and hits many small matmul shapes (batch=1, token-by-token decoding). cuBLAS-backed fusion would help significantly.
 
 ---
 
