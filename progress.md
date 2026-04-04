@@ -73,6 +73,32 @@ through all `src/gguf/` files so the pipeline compiles for any CubeCL-backed Bur
 - `cargo build --features "wgpu,cli,native-tokenizer,cuda"` → clean (CUDA path compiles too)
 - `cargo test --features "wgpu,native-tokenizer"` → **239 tests pass** (231 unit + 4 integration + 3 tts_model + 1 tts integration)
 
+### Phase 5 — Option 1: aligned weights + kernel constant tuning ✅ Complete
+
+**Goal:** Eliminate `read_u32_unaligned` overhead and tune kernel constants for 4090.
+
+**Changes:**
+- `tensor.rs`: `from_q4_bytes` now repacks 18-byte Q4_0 GGUF blocks to 20-byte aligned format
+  (5 u32s: `[scale_f16|0x0000, data_u32×4]`). `read_bytes` unpacks back to 18-byte for
+  API compatibility. `dequantize` updated to read new layout.
+- `op.rs`: Removed `read_u32_unaligned`. Kernels now use `block_u32 = global_block * 5u32` with
+  direct indexed u32 reads. `TILED_WG_X` 128 → 256. `TILE_K` 512 → 1024.
+
+**Benchmark (RTX 4090, warm autotune cache, CUBECL_AUTOTUNE_LEVEL=minimal):**
+
+| Text | Duration | RTF | vs. Phase 4 baseline |
+|---|---|---|---|
+| "Hello world" | 1.60s | 21.5× | 30.3× → 21.5× (−29%) |
+| Long sentence (~17 tokens) | 6.80s | 8.4× | ~9.3× → 8.4× (−10%) |
+
+**CubeCL 0.9.0 bug (unrelated to our changes):**
+`simple_async_mma` (a conv forward kernel) is selected by autotune for certain codec
+decoder shapes but then fails during actual launch with:
+> "Too many data will be loaded … total unit count 128 divides number of lines in stage"
+Workaround: `CUBECL_AUTOTUNE_LEVEL=minimal` uses coarser key anchoring (scale factor 1.25)
+which bins the problematic shapes into different buckets that don't select the async MMA variant.
+Set via `env.setdefault("CUBECL_AUTOTUNE_LEVEL", "minimal")` in `main.py` for CUDA runs.
+
 ### Phase 4 — CUDA end-to-end and benchmark ✅ Complete
 
 **Goal:** Replace the `run_cuda()` smoke test bail with actual Q4 inference, benchmark vs llvmpipe.

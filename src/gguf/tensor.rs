@@ -12,8 +12,12 @@ use cubecl::server::Handle;
 
 /// A Q4_0 quantized weight tensor living on GPU.
 ///
-/// The buffer contains raw Q4_0 blocks (18 bytes per block of 32 elements),
-/// laid out exactly as in GGUF.
+/// Weights are stored in an aligned 20-byte-per-block format (5 u32s):
+///   u32[0]: F16 scale in bits [15:0], bits [31:16] zero-padded
+///   u32[1..4]: 16 bytes of packed Q4 nibbles
+/// This differs from the 18-byte GGUF on-disk format; repacking happens in
+/// [`Q4Tensor::from_q4_bytes`] so GPU kernels can use direct indexed u32
+/// reads with no byte-offset arithmetic.
 pub struct Q4Tensor<R: CubeRuntime> {
     pub(crate) handle: Handle,
     shape: [usize; 2],
@@ -23,11 +27,15 @@ pub struct Q4Tensor<R: CubeRuntime> {
 }
 
 impl<R: CubeRuntime> Q4Tensor<R> {
-    /// Upload raw Q4_0 bytes to a GPU storage buffer.
+    /// Upload raw Q4_0 bytes to a GPU storage buffer, repacking to aligned format.
     ///
     /// Shape is `[N, K]` = `[out_features, in_features]`, matching PyTorch/GGUF
-    /// convention. `raw_bytes` must contain exactly `(N * K / 32) * 18` bytes.
-    /// The element count `N * K` must be divisible by 32.
+    /// convention. `raw_bytes` must contain exactly `(N * K / 32) * 18` bytes
+    /// in GGUF Q4_0 format (18 bytes per block).
+    ///
+    /// On upload the blocks are repacked to 20-byte aligned format (5 u32s per
+    /// block) so GPU kernels can use direct indexed u32 reads with no
+    /// byte-offset arithmetic. See struct docstring for layout details.
     pub fn from_q4_bytes(raw_bytes: &[u8], shape: [usize; 2], device: &R::Device) -> Result<Self> {
         let [n, k] = shape;
         let num_elements = k * n;
@@ -45,17 +53,20 @@ impl<R: CubeRuntime> Q4Tensor<R> {
 
         let client = R::client(device);
 
-        // Pad to 4-byte alignment for u32-granularity access in the kernel.
-        // Q4_0 blocks are 18 bytes, so total size may not be a multiple of 4.
-        let padded = if !raw_bytes.len().is_multiple_of(4) {
-            let pad = 4 - (raw_bytes.len() % 4);
-            let mut buf = raw_bytes.to_vec();
-            buf.resize(raw_bytes.len() + pad, 0);
-            buf
-        } else {
-            raw_bytes.to_vec()
-        };
-        let handle = client.create_from_slice(&padded);
+        // Repack from GGUF 18-byte blocks to aligned 20-byte blocks (5 u32s):
+        //   bytes [0..2)  → F16 scale (same position)
+        //   bytes [2..4)  → 0x0000 padding
+        //   bytes [4..20) → 16 bytes Q4 data (was at [2..18))
+        let mut repacked = Vec::with_capacity(num_blocks * 20);
+        for i in 0..num_blocks {
+            let src = &raw_bytes[i * 18..(i + 1) * 18];
+            repacked.push(src[0]);  // F16 scale lo
+            repacked.push(src[1]);  // F16 scale hi
+            repacked.push(0u8);     // padding
+            repacked.push(0u8);     // padding
+            repacked.extend_from_slice(&src[2..18]); // 16 bytes Q4 nibbles
+        }
+        let handle = client.create_from_slice(&repacked);
 
         Ok(Self {
             handle,
@@ -76,16 +87,23 @@ impl<R: CubeRuntime> Q4Tensor<R> {
         self.num_blocks
     }
 
-    /// Read raw Q4_0 bytes from GPU.
+    /// Read raw Q4_0 bytes from GPU, unpacking back to GGUF 18-byte format.
     pub fn read_bytes(&self) -> Vec<u8> {
         let raw = self.client.read_one(self.handle.clone());
-        let expected = self.num_blocks * 18;
+        let expected_aligned = self.num_blocks * 20;
         assert!(
-            raw.len() >= expected,
-            "Q4Tensor::read_bytes: GPU buffer shorter than expected: got {}, expected {expected}",
+            raw.len() >= expected_aligned,
+            "Q4Tensor::read_bytes: GPU buffer shorter than expected: got {}, expected {expected_aligned}",
             raw.len()
         );
-        raw[..expected].to_vec()
+        // Unpack aligned 20-byte format → GGUF 18-byte format
+        let mut out = Vec::with_capacity(self.num_blocks * 18);
+        for i in 0..self.num_blocks {
+            let base = i * 20;
+            out.extend_from_slice(&raw[base..base + 2]);      // F16 scale
+            out.extend_from_slice(&raw[base + 4..base + 20]); // 16 bytes Q4 data
+        }
+        out
     }
 
     /// Compute client for this tensor.
@@ -121,13 +139,13 @@ impl Q4Tensor<burn::backend::wgpu::WgpuRuntime> {
         let mut output = vec![0.0f32; num_elements];
 
         for block_idx in 0..self.num_blocks {
-            let offset = block_idx * 18;
+            let offset = block_idx * 20; // 20-byte aligned blocks on GPU
             let d_bits = u16::from_le_bytes([raw[offset], raw[offset + 1]]);
             let d = half::f16::from_bits(d_bits).to_f32();
 
             let base = block_idx * 32;
             for i in 0..16 {
-                let byte = raw[offset + 2 + i];
+                let byte = raw[offset + 4 + i]; // data starts at byte 4 (after scale + 2-byte pad)
                 let lo = (byte & 0x0F) as f32 - 8.0;
                 let hi = ((byte >> 4) & 0x0F) as f32 - 8.0;
                 output[base + i] = lo * d;
