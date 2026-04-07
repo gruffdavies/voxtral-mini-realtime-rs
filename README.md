@@ -66,18 +66,20 @@ This fork adds CUDA support to the Q4 GGUF inference path via CubeCL. The change
 
 ### CUDA TTS (RTX 4090, WSL2)
 
-Warm autotune cache (`CUBECL_AUTOTUNE_LEVEL=minimal`), Q4 GGUF, 3 Euler steps:
+Q4 GGUF, 3 Euler steps, `CUBECL_AUTOTUNE_LEVEL=minimal`. ~6s of audio (~75 frames):
 
-| Text | Audio duration | RTF | Notes |
-|------|---------------|-----|-------|
-| "Hello world" | 1.6s | 15.2× | short, low amortisation |
-| Long sentence (~17 tokens) | 6.8s | 6.4× | longer text amortises overhead better |
-| Cold start (first run) | 1.2s | 65.6× | includes one-time autotune |
+| Scenario | Inference time | RTF | Notes |
+|----------|---------------|-----|-------|
+| Warm (1 prior generation in-process) | 3.2s | **0.51×** | 2× faster than real-time |
+| New process, CUDA disk cache warm | 8.5s | **1.50×** | slightly slower than real-time |
+| First ever run (no cache) | — | ~65× | PTX JIT compilation from scratch |
+| Model load | 3.5–4.4s | — | one-time per process, not included in RTF |
 
-- RTF > 1.0 means slower than real-time; **not real-time yet**
-- ~13–30× faster than llvmpipe CPU baseline (~200× RTF)
-- Bottleneck: ~100+ kernel dispatches per decode step, not the Q4 matmul itself
-- `CUBECL_AUTOTUNE_LEVEL=minimal` required to avoid a CubeCL 0.9.0 bug with async MMA kernels
+- RTF < 1.0 means faster than real-time
+- **0.51× RTF at steady state** — 2× faster than real-time once kernels are compiled
+- The CUDA disk cache (`~/.nv/ComputeCache`) persists compiled kernels across process restarts
+- Profiling (Nsight Systems) confirmed CPU-dispatch-limited at steady state: ~150 kernel launches per frame with visible CPU gaps between backbone layers. GPU is not the bottleneck.
+- `CUBECL_AUTOTUNE_LEVEL=minimal` required to avoid a CubeCL 0.9.0 async MMA bug
 
 ### Architecture Notes
 

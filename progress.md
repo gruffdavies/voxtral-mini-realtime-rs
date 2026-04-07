@@ -152,6 +152,105 @@ Autotuning is one-time per problem shape; cached in `~/.cache/burn/...` for subs
 
 ---
 
+---
+
+## Phase 7 — Nsight Systems profiling ✅ Complete
+
+**Goal:** Answer one question: are we losing time to many small kernel launches / CPU gaps, or to a few heavy kernels?
+
+### Setup
+
+Added NVTX range annotations (`src/nvtx.rs`, `nvtx` crate gated on `cuda` feature) at:
+
+```
+PROFILED_RUN
+  tts_prefill / tts_frame_N / tts_readback
+    bb_fwd / bb_layer_N
+      attn_qkv / attn_scores / attn_softmax / attn_v / attn_out_proj
+      ffn
+    euler_ode / euler_step_N
+      fm_pv / fm_layer_N
+    q4mm MxN   ← at every Q4 kernel dispatch, with actual shapes
+```
+
+Added `profile-tts` binary: loads model, optional warmup runs, profiled run with NVTX-annotated `PROFILED_RUN` range.
+
+Profile command:
+```bash
+CUBECL_AUTOTUNE_LEVEL=minimal \
+nsys profile --trace=cuda,nvtx --output profile_out \
+  ./target/release/profile-tts \
+    --gguf ../voxtral-tts-q4/models/voxtral-tts-q4.gguf \
+    --text "The quick brown fox jumps over the lazy dog. She sells seashells by the seashore." \
+    --warmup-runs 1
+```
+
+### Findings
+
+**5,146,357 CUDA events in ~55s under nsys** — immediately signals many small launches.
+
+**NVTX frame timings (under nsys, RTX 4090, WSL2):**
+
+| Frame | Duration | Notes |
+|-------|----------|-------|
+| tts_prefill | 6.944s | Full input sequence through 26 layers |
+| tts_frame_0 | 16.649s | PTX JIT compilation dominating |
+| tts_frame_1 | 1.134s | More JIT (`cudaModuleLoad` visible in trace) |
+| tts_frame_2 | 40ms | JIT complete, fast |
+| tts_frame_3 | 953ms | One more autotune event |
+| tts_frame_4–13 | 38–80ms | Steady state |
+
+**Frame 0 breakdown:** `euler_ode` = 14.9s out of 16.6s (89%). The FM transformer shapes were being JIT-compiled from PTX → native GPU code on first use. The GPU was almost completely idle during this time.
+
+**Steady-state frame (frame 10, 38ms):** GPU kernel row shows a repeating cluster pattern — ~26 clusters of 4–8 small kernels per backbone layer. Visible CPU gaps between clusters. **CPU-dispatch-limited, not GPU-bound.**
+
+**nsys overhead is severe** (~17×) due to recording 5M+ CUDA events. Steady-state frames look correct (38ms) but the slow early frames are exaggerated by the profiler.
+
+### Actual RTF measurements (without nsys)
+
+```
+# With warmup (1 prior generation in-process):
+RTF = 0.51×  (2× faster than real-time)
+71–78 frames, 3.2s wall time for ~6s of audio
+
+# Without warmup (new process, CUDA disk cache warm):
+RTF = 1.50×  (slightly slower than real-time)
+71 frames, 8.5s wall time
+
+# Model load (separate from inference):
+3.5–4.4s  (one-time per process)
+```
+
+**CUDA kernel disk cache** (`~/.nv/ComputeCache`) reduces cold start from ~65× → 1.5× RTF. The remaining gap to 0.51× is per-shape first-use overhead within each new process (loading from disk, first kernel execution).
+
+### Root cause summary
+
+Two distinct problems, not one:
+
+1. **JIT compilation on first use** (frames 0–1): CubeCL generates PTX; CUDA JIT-compiles it to native code per shape per process. Mitigated by disk cache; eliminated by in-process warmup. Affects cold-start latency only.
+
+2. **CPU dispatch overhead at steady state**: ~150+ kernel launches per decode frame (26 backbone layers × ~4–6 kernels/layer + FM transformer). Each requires a CPU round-trip. The GPU idles between layers waiting for the CPU to dispatch the next batch. **This is the fundamental steady-state bottleneck.**
+
+### Implications for deployment
+
+| Use case | Story |
+|----------|-------|
+| Long-running service (load once, serve many) | 1 warmup generation at startup → 0.51× RTF per request. Good. |
+| Per-process CLI | 1.5× RTF + 4s model load = ~12s for 6s audio. Marginal. |
+| Browser / WebGPU | Unaffected — separate path, different problem space. |
+
+This is also why production services use vLLM: model resident in GPU memory, warm from the first request, batched attention kernels rather than per-layer dispatches.
+
+### Next steps (if pursuing further)
+
+**CUDA Graphs** — captures the fixed decode step as a graph and replays with one launch, eliminating all per-layer CPU dispatch overhead. Potential 2–4× improvement at steady state. Not natively supported by Burn/CubeCL today; would require wrapping the decode loop.
+
+**RMSNorm fusion** — every layer has two `rms_norm → matmul` pairs. A fused kernel halves the cluster size per layer (~75 fewer launches per frame). Tractable with CubeCL.
+
+**Per-process warmup** — a lightweight "touch all shapes" pass at model load time (run a silent 1-frame generation) would bring per-process cold start close to the 0.51× warm figure without the user waiting for a full generation.
+
+---
+
 ## Key files
 
 | File | Status | Notes |
