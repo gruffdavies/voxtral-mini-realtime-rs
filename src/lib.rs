@@ -23,6 +23,7 @@ pub mod audio;
 #[cfg(feature = "wgpu")]
 pub mod gguf;
 pub mod models;
+pub mod nvtx;
 pub mod profiling;
 pub mod tokenizer;
 pub mod tts;

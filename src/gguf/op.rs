@@ -316,6 +316,9 @@ where
     // Weights buffer: 5 u32s per block (aligned 20-byte format).
     let weights_u32_len = weights.num_blocks() * 5;
 
+    #[cfg(feature = "cuda")]
+    let _nvtx = crate::nvtx::Guard::new(&format!("q4mm {m}x{n}"));
+
     dispatch(
         &client,
         b,

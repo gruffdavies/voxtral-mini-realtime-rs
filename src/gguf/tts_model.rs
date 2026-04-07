@@ -217,9 +217,12 @@ where
         x: Tensor<B, 3>,
         caches: &mut LayerCaches<B>,
     ) -> Tensor<B, 3> {
+        crate::nvtx_range!("bb_fwd");
         let mut x = x;
         for (i, layer) in self.layers.iter().enumerate() {
             if let Some(cache) = caches.get_mut(i) {
+                #[cfg(feature = "cuda")]
+                let _nvtx_layer = crate::nvtx::Guard::new(&format!("bb_layer_{i}"));
                 x = layer.forward_with_cache(x, &self.rope, cache);
             }
         }
@@ -313,7 +316,10 @@ where
         let mut frames = Vec::with_capacity(max_frames);
 
         // Phase 1: Prefill — process the entire input sequence, populate KV caches.
-        let prefill_out = self.forward_with_cache(input_sequence, &mut caches);
+        let prefill_out = {
+            crate::nvtx_range!("tts_prefill");
+            self.forward_with_cache(input_sequence, &mut caches)
+        };
         let [batch, seq_len, dim] = prefill_out.dims();
         let mut h = prefill_out.slice([0..batch, (seq_len - 1)..seq_len, 0..dim]);
 
@@ -322,6 +328,9 @@ where
         // Dispatch semantic + euler in parallel before readback (both use h.clone()).
         // Single GPU sync per frame flushes all queued work.
         for frame_idx in 0..max_frames {
+            #[cfg(feature = "cuda")]
+            let _nvtx_frame = crate::nvtx::Guard::new(&format!("tts_frame_{frame_idx}"));
+
             // Dispatch semantic + euler together (no sync yet)
             let semantic_logits = fm.semantic_logits(h.clone());
             let semantic_idx_f32 = semantic_logits.argmax(1).float(); // [1, 1] as f32
@@ -336,9 +345,12 @@ where
 
             // Fused readback: concat [semantic_idx(1), acoustic(36)] → single transfer
             let combined = Tensor::cat(vec![semantic_idx_f32, acoustic_indices], 1); // [1, 37]
-            let combined_data = Tensor::<B, 2>::into_data_async(combined)
-                .await
-                .map_err(|e| format!("Failed to read combined data: {e}"))?;
+            let combined_data = {
+                crate::nvtx_range!("tts_readback");
+                Tensor::<B, 2>::into_data_async(combined)
+                    .await
+                    .map_err(|e| format!("Failed to read combined data: {e}"))?
+            };
             let combined_slice = combined_data
                 .as_slice::<f32>()
                 .map_err(|e| format!("Failed to extract combined data: {e}"))?;
@@ -530,6 +542,8 @@ where
     ) -> Tensor<B, 2> {
         let device = h.device();
 
+        crate::nvtx_range!("fm_pv");
+
         // Project inputs to FM dim
         let x_proj = self.input_projection.forward(x_t); // [B, 1, 3072]
         let t_embed = self.time_embedding.embed(t, &device); // [1, 1, 3072]
@@ -545,7 +559,9 @@ where
 
         // Run through bidirectional layers
         let mut hidden = seq;
-        for layer in &self.layers {
+        for (i, layer) in self.layers.iter().enumerate() {
+            #[cfg(feature = "cuda")]
+            let _nvtx_layer = crate::nvtx::Guard::new(&format!("fm_layer_{i}"));
             hidden = layer.forward(hidden, &self.rope, 0);
         }
 
@@ -576,9 +592,13 @@ where
         let h_uncond: Tensor<B, 3> = Tensor::zeros([batch, seq, dim], &device);
         let h_batched = Tensor::cat(vec![h, h_uncond], 0); // [2, 1, dim]
 
+        crate::nvtx_range!("euler_ode");
         let mut x_t = noise;
 
         for step in 0..(n_points - 1) {
+            #[cfg(feature = "cuda")]
+            let _nvtx_step = crate::nvtx::Guard::new(&format!("euler_step_{step}"));
+
             let t = step as f32 / (n_points - 1) as f32;
             let dt = 1.0 / (n_points - 1) as f32;
 

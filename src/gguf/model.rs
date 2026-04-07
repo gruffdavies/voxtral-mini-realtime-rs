@@ -96,13 +96,16 @@ where
         let [batch, seq_len, _] = x.dims();
 
         // QKV projection — fused (1 kernel) or separate (3 kernels)
-        let (q, k, v) = if let Some(fused) = &self.fused_qkv {
-            fused.forward(x)
-        } else {
-            let q = self.wq.forward(x.clone());
-            let k = self.wk.forward(x.clone());
-            let v = self.wv.forward(x);
-            (q, k, v)
+        let (q, k, v) = {
+            crate::nvtx_range!("attn_qkv");
+            if let Some(fused) = &self.fused_qkv {
+                fused.forward(x)
+            } else {
+                let q = self.wq.forward(x.clone());
+                let k = self.wk.forward(x.clone());
+                let v = self.wv.forward(x);
+                (q, k, v)
+            }
         };
 
         let q = q.reshape([batch, seq_len, self.n_heads, self.head_dim]);
@@ -118,7 +121,10 @@ where
         let (k, v) = self.expand_kv(k, v);
 
         let k_t = k.swap_dims(2, 3);
-        let scores = q.matmul(k_t) * self.scale;
+        let scores = {
+            crate::nvtx_range!("attn_scores");
+            q.matmul(k_t) * self.scale
+        };
 
         let scores = if causal {
             apply_causal_mask(scores, seq_len)
@@ -131,11 +137,18 @@ where
             scores
         };
 
-        let attn = softmax(scores, 3);
-        let out = attn.matmul(v);
+        let attn = {
+            crate::nvtx_range!("attn_softmax");
+            softmax(scores, 3)
+        };
+        let out = {
+            crate::nvtx_range!("attn_v");
+            attn.matmul(v)
+        };
 
         let out = out.swap_dims(1, 2);
         let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);
+        crate::nvtx_range!("attn_out_proj");
         self.wo.forward(out)
     }
 
@@ -151,13 +164,16 @@ where
         let offset = cache.seq_len();
 
         // QKV projection — fused (1 kernel) or separate (3 kernels)
-        let (q, k, v) = if let Some(fused) = &self.fused_qkv {
-            fused.forward(x)
-        } else {
-            let q = self.wq.forward(x.clone());
-            let k = self.wk.forward(x.clone());
-            let v = self.wv.forward(x);
-            (q, k, v)
+        let (q, k, v) = {
+            crate::nvtx_range!("attn_qkv");
+            if let Some(fused) = &self.fused_qkv {
+                fused.forward(x)
+            } else {
+                let q = self.wq.forward(x.clone());
+                let k = self.wk.forward(x.clone());
+                let v = self.wv.forward(x);
+                (q, k, v)
+            }
         };
 
         let q = q.reshape([batch, seq_len, self.n_heads, self.head_dim]);
@@ -176,7 +192,10 @@ where
         let (k, v) = self.expand_kv(k, v);
 
         let k_t = k.swap_dims(2, 3);
-        let scores = q.matmul(k_t) * self.scale;
+        let scores = {
+            crate::nvtx_range!("attn_scores");
+            q.matmul(k_t) * self.scale
+        };
 
         let scores = if causal {
             apply_causal_mask_with_offset(scores, seq_len, total_seq_len, offset)
@@ -189,11 +208,18 @@ where
             scores
         };
 
-        let attn = softmax(scores, 3);
-        let out = attn.matmul(v);
+        let attn = {
+            crate::nvtx_range!("attn_softmax");
+            softmax(scores, 3)
+        };
+        let out = {
+            crate::nvtx_range!("attn_v");
+            attn.matmul(v)
+        };
 
         let out = out.swap_dims(1, 2);
         let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);
+        crate::nvtx_range!("attn_out_proj");
         self.wo.forward(out)
     }
 
@@ -302,6 +328,7 @@ where
 
     /// Forward pass.
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        crate::nvtx_range!("ffn");
         if let Some(fused) = &self.fused_gate_up {
             let (gate, up) = fused.forward(x);
             self.w2.forward(silu(gate) * up)

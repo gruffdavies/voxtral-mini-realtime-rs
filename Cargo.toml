@@ -11,7 +11,7 @@ authors = ["Trevor Strieber"]
 default = ["wgpu", "native-tokenizer"]
 wgpu = ["burn/wgpu"]
 # CUDA backend for native GPU inference (requires CUDA toolkit)
-cuda = ["burn/cuda", "cubecl/cuda"]
+cuda = ["burn/cuda", "cubecl/cuda", "dep:nvtx"]
 cli = ["clap", "indicatif"]
 hub = ["hf-hub"]
 # Tekken BPE encoding via tiktoken (WASM-compatible, no C deps)
@@ -38,6 +38,8 @@ cubecl = { version = "0.9", default-features = false, features = ["wgpu"] }
 burn-cubecl = { version = "0.20", default-features = false }
 # CUDA backend (enabled by "cuda" feature)
 burn-cuda = { version = "0.20", optional = true }
+# NVTX profiling annotations for Nsight Systems (enabled via "cuda" feature)
+nvtx = { version = "1", optional = true }
 
 # Tekken BPE encoding (tiktoken core, WASM-compatible)
 tiktoken-rs = { version = "0.9", optional = true }
@@ -100,6 +102,11 @@ pollster = "0.4.0"
 name = "voxtral"
 path = "src/bin/voxtral/main.rs"
 required-features = ["cli", "native-tokenizer"]
+
+[[bin]]
+name = "profile-tts"
+path = "src/bin/profile_tts.rs"
+required-features = ["cuda", "cli", "native-tokenizer"]
 
 [[bin]]
 name = "e2e-bench"
