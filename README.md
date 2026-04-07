@@ -1,4 +1,7 @@
-# Voxtral Mini 4B Realtime (Rust)
+# Voxtral Mini 4B Realtime (Rust) — CUDA fork
+
+> **Fork of [TrevorS/voxtral-mini-realtime-rs](https://github.com/TrevorS/voxtral-mini-realtime-rs)**
+> This branch (`cuda-backend`) adds experimental CUDA support via CubeCL. See [What's different in this fork](#whats-different-in-this-fork) below.
 
 [![HuggingFace ASR](https://img.shields.io/badge/%F0%9F%A4%97-ASR_Model-yellow)](https://huggingface.co/TrevorJS/voxtral-mini-realtime-gguf)
 [![HuggingFace TTS](https://img.shields.io/badge/%F0%9F%A4%97-TTS_Model-yellow)](https://huggingface.co/TrevorJS/voxtral-tts-q4-gguf)
@@ -7,11 +10,31 @@
 
 Streaming speech recognition and text-to-speech running natively and in the browser. A pure Rust implementation of Mistral's [Voxtral Mini 4B Realtime](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602) (ASR) and [Voxtral 4B TTS](https://huggingface.co/mistralai/Voxtral-4B-TTS-2603) models using the [Burn](https://burn.dev) ML framework.
 
+## What's different in this fork
+
+This fork adds CUDA support to the Q4 GGUF inference path via CubeCL. The changes are confined to `src/gguf/` and the CLI binaries — the browser/WASM path is unchanged.
+
+**Changes relative to upstream:**
+
+1. **`cube!` macro kernels** replace the WGSL `SourceKernel` dispatch in `src/gguf/op.rs`. The kernels are defined using CubeCL's `cube!` macro, which compiles to WGSL on WebGPU and PTX on CUDA from a single source.
+
+2. **Generic backend** — all `src/gguf/` structs are now parameterised over `<R: CubeRuntime, B: Backend<FloatTensorPrimitive = CubeTensor<R>>>` rather than the concrete `Wgpu` type. The WASM bindings remain concrete (`type Backend = Wgpu<f32, i32>`) so the browser build is unaffected.
+
+3. **`cuda` feature flag** — `cargo build --features "...,cuda"` builds the CUDA path. `--device cuda` selects it at runtime.
+
+4. **Aligned Q4_0 block format** — weights are repacked from 18-byte GGUF blocks to 20-byte aligned blocks (5× u32) at load time, eliminating unaligned reads in the GPU kernel.
+
+**Status:** The CUDA path works end-to-end on RTX 4090 but is not yet real-time (see benchmarks below). The remaining bottleneck is kernel-launch overhead across ~100+ small matmul dispatches per decode step; the Q4 matmul itself is not the limiting factor after tuning. This is experimental work — see [CUDA Benchmarks](#cuda-tts-rtx-4090-wsl2) for honest numbers.
+
+**Note on authorship:** This work was implemented by Claude Code (AI-assisted), with architectural decisions reviewed using multiple AI systems (ChatGPT, Gemini) and oversight from an experienced (non-Rust, non-CUDA) engineer. It has not been reviewed by a Rust or CUDA expert.
+
+---
+
 ## Benchmarks
 
-NVIDIA DGX Spark (GB10, LPDDR5x).
+### Upstream baselines (NVIDIA DGX Spark, GB10, LPDDR5x)
 
-### ASR (Speech Recognition)
+#### ASR (Speech Recognition)
 
 16s test audio, 3-run average:
 
@@ -23,7 +46,7 @@ NVIDIA DGX Spark (GB10, LPDDR5x).
 
 - **8.49% WER** on FLEURS English (647 utterances), vs. Mistral's reported 4.90% at f32
 
-### TTS (Text-to-Speech)
+#### TTS (Text-to-Speech)
 
 "The quick brown fox jumps over the lazy dog" (9 tokens), casual_female voice:
 
@@ -41,9 +64,24 @@ NVIDIA DGX Spark (GB10, LPDDR5x).
 - Q4 model load: 3.9s native, 9.2s WASM (including shard download over localhost)
 - 20 preset voices across 9 languages. Use `--euler-steps` to tune speed/quality tradeoff
 
+### CUDA TTS (RTX 4090, WSL2)
+
+Warm autotune cache (`CUBECL_AUTOTUNE_LEVEL=minimal`), Q4 GGUF, 3 Euler steps:
+
+| Text | Audio duration | RTF | Notes |
+|------|---------------|-----|-------|
+| "Hello world" | 1.6s | 15.2× | short, low amortisation |
+| Long sentence (~17 tokens) | 6.8s | 6.4× | longer text amortises overhead better |
+| Cold start (first run) | 1.2s | 65.6× | includes one-time autotune |
+
+- RTF > 1.0 means slower than real-time; **not real-time yet**
+- ~13–30× faster than llvmpipe CPU baseline (~200× RTF)
+- Bottleneck: ~100+ kernel dispatches per decode step, not the Q4 matmul itself
+- `CUBECL_AUTOTUNE_LEVEL=minimal` required to avoid a CubeCL 0.9.0 bug with async MMA kernels
+
 ### Architecture Notes
 
-- Custom WGSL compute shaders with vectorized u32 reads and vec4 dot products
+- Q4 kernels written with CubeCL `cube!` macro — compiles to WGSL (WebGPU/Vulkan) or PTX (CUDA) from one source
 - Dual-path kernel dispatch: shared-memory tiled kernel for single-token decode, naive kernel for multi-row encode/prefill
 - Q4 GGUF (2.5 GB ASR, 2.67 GB TTS) runs entirely client-side in a browser tab via WASM + WebGPU
 
@@ -109,6 +147,23 @@ cargo run --release --features "wgpu,cli,hub" --bin voxtral -- \
 cargo run --release --features "wgpu,cli,hub" --bin voxtral -- speak --list-voices
 ```
 
+### CUDA (experimental)
+
+Requires CUDA toolkit and an NVIDIA GPU. Not real-time yet — see benchmarks above.
+
+```bash
+# Build with CUDA feature
+cargo build --release --features "wgpu,cli,hub,cuda"
+
+# TTS via CUDA (Q4)
+CUBECL_AUTOTUNE_LEVEL=minimal \
+cargo run --release --features "wgpu,cli,hub,cuda" --bin voxtral -- \
+  speak --text "Hello world" --gguf models/voxtral-tts-q4.gguf \
+  --device cuda --euler-steps 3
+```
+
+The `CUBECL_AUTOTUNE_LEVEL=minimal` env var is required to avoid a CubeCL 0.9.0 bug with async MMA kernel selection on certain codec decoder shapes.
+
 20 preset voices across 9 languages. The TTS pipeline runs backbone (Ministral 3B) autoregressive decoding, flow-matching acoustic prediction, and codec synthesis to produce 24 kHz audio.
 
 ## Architecture
@@ -125,12 +180,13 @@ Audio (16kHz mono)
 
 ### Two Inference Paths
 
-| | BF16 (native) | Q4 GGUF (native + browser) |
-|---|---|---|
-| Weights | SafeTensors (~9 GB) | GGUF Q4_0 (~2.5 GB) |
-| Linear ops | Burn tensor matmul | Custom WGSL shader (fused dequant + matmul) |
-| Embeddings | f32 tensor (1.5 GiB) | Q4 on GPU (216 MB) + CPU bytes for lookups |
-| Browser | No | Yes (WASM + WebGPU) |
+| | BF16 (native) | Q4 GGUF (native + browser) | Q4 GGUF (CUDA, experimental) |
+|---|---|---|---|
+| Weights | SafeTensors (~9 GB) | GGUF Q4_0 (~2.5 GB) | GGUF Q4_0 (~2.5 GB) |
+| Linear ops | Burn tensor matmul | `cube!` kernel → WGSL (fused dequant + matmul) | `cube!` kernel → PTX (fused dequant + matmul) |
+| Embeddings | f32 tensor (1.5 GiB) | Q4 on GPU (216 MB) + CPU bytes for lookups | Q4 on GPU (216 MB) + CPU bytes for lookups |
+| Browser | No | Yes (WASM + WebGPU) | No |
+| Feature flag | `wgpu` | `wgpu` | `cuda` |
 
 ### Q4 Padding Workaround
 
@@ -170,6 +226,7 @@ wasm-pack build --target web --no-default-features --features wasm
 | `wasm` | Browser support: wasm-bindgen, WebGPU device init, JS bindings |
 | `cli` | CLI binary with clap + indicatif |
 | `hub` | HuggingFace Hub model downloads |
+| `cuda` | NVIDIA CUDA backend via CubeCL (requires CUDA toolkit) |
 
 ## Testing
 
